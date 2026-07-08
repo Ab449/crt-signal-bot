@@ -85,13 +85,26 @@ def detect_crt(candles):
     high1, low1 = base["high"], base["low"]
     high2, low2, close2 = manip["high"], manip["low"], manip["close"]
 
+    MIN_RR = 1.0  # discard anything below 1:1 as low quality / broken math
+
     # Bullish CRT: sweep sell-side liquidity (low1) then close back inside
     if low2 < low1 and close2 > low1:
         entry_low = low2 + (close2 - low2) * 0.21   # ~79% retrace level
         entry_high = low2 + (close2 - low2) * 0.50  # ~50% retrace level
         stop = low2 * 0.999  # just beyond the sweep wick
         target = high1
-        rr = round((target - entry_high) / (entry_high - stop), 2) if entry_high != stop else 0
+
+        # Sanity check: stop < entry_low <= entry_high < target, all distinct
+        if not (stop < entry_low <= entry_high < target):
+            return None
+        risk = entry_high - stop
+        reward = target - entry_high
+        if risk <= 0:
+            return None
+        rr = round(reward / risk, 2)
+        if rr < MIN_RR:
+            return None
+
         return {
             "direction": "BULLISH",
             "base_time": base["datetime"],
@@ -110,7 +123,18 @@ def detect_crt(candles):
         entry_low = high2 - (high2 - close2) * 0.50
         stop = high2 * 1.001
         target = low1
-        rr = round((entry_low - target) / (stop - entry_low), 2) if stop != entry_low else 0
+
+        # Sanity check: target < entry_low <= entry_high < stop, all distinct
+        if not (target < entry_low <= entry_high < stop):
+            return None
+        risk = stop - entry_low
+        reward = entry_low - target
+        if risk <= 0:
+            return None
+        rr = round(reward / risk, 2)
+        if rr < MIN_RR:
+            return None
+
         return {
             "direction": "BEARISH",
             "base_time": base["datetime"],
