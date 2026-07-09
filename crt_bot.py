@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 
 # ---------- CONFIG ----------
 SYMBOL = "XAU/USD"
-TIMEFRAMES = ["4h", "1h", "15min"]   # TwelveData interval strings
+TIMEFRAMES = ["1h", "15min"]   # TwelveData interval strings (4h removed per preference)
 CANDLES_TO_FETCH = 20
 STATE_FILE = "state.json"
 
@@ -48,6 +48,7 @@ def fetch_candles(interval: str):
         "outputsize": CANDLES_TO_FETCH,
         "apikey": TWELVEDATA_API_KEY,
         "order": "ASC",  # oldest -> newest
+        "timezone": "UTC",  # force UTC so signal timestamps are unambiguous
     }
     resp = requests.get(TWELVEDATA_URL, params=params, timeout=20)
     data = resp.json()
@@ -69,32 +70,21 @@ def fetch_candles(interval: str):
 
 
 # ---------- CRT DETECTION ----------
-def detect_crt(candles):
-    """
-    Looks at the last CLOSED pair of candles: [-3]=base, [-2]=manipulation.
-    (The most recent candle [-1] is still forming, so we don't use it as
-    confirmation to avoid false signals mid-candle.)
-    Returns a signal dict or None.
-    """
-    if len(candles) < 3:
-        return None
-
-    base = candles[-3]
-    manip = candles[-2]
-
+def _check_pair(base, manip):
+    """Given a base candle and the following manipulation candle, return a
+    signal dict if a valid CRT setup exists, else None."""
     high1, low1 = base["high"], base["low"]
     high2, low2, close2 = manip["high"], manip["low"], manip["close"]
 
-    MIN_RR = 1.0  # discard anything below 1:1 as low quality / broken math
+    MIN_RR = 0.5  # loosened so more setups qualify
 
     # Bullish CRT: sweep sell-side liquidity (low1) then close back inside
     if low2 < low1 and close2 > low1:
-        entry_low = low2 + (close2 - low2) * 0.21   # ~79% retrace level
-        entry_high = low2 + (close2 - low2) * 0.50  # ~50% retrace level
-        stop = low2 * 0.999  # just beyond the sweep wick
+        entry_low = low2 + (close2 - low2) * 0.21
+        entry_high = low2 + (close2 - low2) * 0.50
+        stop = low2 * 0.999
         target = high1
 
-        # Sanity check: stop < entry_low <= entry_high < target, all distinct
         if not (stop < entry_low <= entry_high < target):
             return None
         risk = entry_high - stop
@@ -124,7 +114,6 @@ def detect_crt(candles):
         stop = high2 * 1.001
         target = low1
 
-        # Sanity check: target < entry_low <= entry_high < stop, all distinct
         if not (target < entry_low <= entry_high < stop):
             return None
         risk = stop - entry_low
@@ -148,6 +137,32 @@ def detect_crt(candles):
         }
 
     return None
+
+
+def detect_crt(candles):
+    """
+    Scans every consecutive (base, manipulation) pair in the fetched candle
+    history (not just the very last one) so more valid setups surface,
+    including recent ones we might otherwise miss. The most recent candle
+    (still forming) is excluded as a 'manipulation' candle to avoid mid-candle
+    false signals, but IS allowed to be used as history context.
+    Returns a list of signal dicts (possibly empty), oldest to newest.
+    """
+    signals = []
+    if len(candles) < 3:
+        return signals
+
+    # candles[:-1] excludes the currently-forming last candle from being
+    # used as the manipulation/confirmation candle.
+    closed = candles[:-1]
+    for i in range(len(closed) - 1):
+        base = closed[i]
+        manip = closed[i + 1]
+        sig = _check_pair(base, manip)
+        if sig:
+            signals.append(sig)
+
+    return signals
 
 
 # ---------- STATE (avoid duplicate alerts) ----------
@@ -177,7 +192,7 @@ def format_message(tf, signal):
         f"*CRT SIGNAL — XAU/USD ({tf})*\n"
         f"Direction: *{signal['direction']}*\n"
         f"Base candle range: {signal['base_range'][0]} - {signal['base_range'][1]}\n"
-        f"Manipulation candle: {signal['manip_time']}\n"
+        f"Manipulation candle: {signal['manip_time']} UTC\n"
         f"Entry zone (OTE): {signal['entry_zone'][0]} - {signal['entry_zone'][1]}\n"
         f"Stop Loss: {signal['stop']}\n"
         f"Target: {signal['target']}\n"
@@ -196,21 +211,20 @@ def main():
         if not candles:
             continue
 
-        signal = detect_crt(candles)
-        if signal is None:
+        signals = detect_crt(candles)
+        if not signals:
             print(f"[{tf}] No CRT setup right now.")
             continue
 
-        state_key = f"{tf}_{signal['manip_time']}"
-        if state.get(state_key):
-            print(f"[{tf}] Signal already alerted for {signal['manip_time']}, skipping.")
-            continue
+        for signal in signals:
+            state_key = f"{tf}_{signal['manip_time']}"
+            if state.get(state_key):
+                continue  # already alerted for this candle
 
-        msg = format_message(tf, signal)
-        send_telegram(msg)
-        print(f"[{tf}] Signal sent:\n{msg}")
-
-        state[state_key] = utc_now
+            msg = format_message(tf, signal)
+            send_telegram(msg)
+            print(f"[{tf}] Signal sent:\n{msg}")
+            state[state_key] = utc_now
 
     save_state(state)
 
